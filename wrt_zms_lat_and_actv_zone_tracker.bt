@@ -1,0 +1,191 @@
+/*
+ * cmd_lat_actv_zone_tracker.bt - does the following:
+ * 1. Track latency for all Write cmds
+ * 2. Track latency for all ZMS cmds (Finish, Reset & Open only)
+ * 3. Track Active Zones. Lists every action that results in change to
+ *    no. of Active Zones (IO, EO, IF, EF, RE)
+ * 4. If latency for particular write cmd exceeds set threshold, flags it, stops
+ *    tracking further cmds and prints latency of all outstanding cmds
+ * 5. Identify ongoing Resets and Finish when write latency spike occurs
+ * 6. On ending the program(^C), the list of Active Zones is printed.
+ *
+ * Notes:
+ * 1: At nvme driver level, __sector in 512 byte based and __data_len is byte based
+ * 2: Has some hard codes that are applicable for ZN540. Review and change for other SSDs.
+ * 3. Latency threshold hard-coded to prevent slowdown - change values directly in code below
+ * 4. Flags 192K writes that take more than 20msec as an example. User can tune as per needs.
+ *
+ */
+
+
+#include <linux/nvme.h>
+#include <linux/blkdev.h>
+#include <linux/blk-mq.h>
+
+
+BEGIN {
+
+	// Switch to toggle cmd info printing - default init to 1 to stop prints
+	@stop_print = 1;
+
+	// Counter for Active Zones
+	@num_active_z = 0;
+}
+
+
+k:nvme_setup_cmd {
+
+    // Works on latest bpftrace(v0.14.0-22-g4e66)	
+    $cmdptr = (struct nvme_command *)*(arg1+sizeof(struct request));
+    
+    //REQ_OP_MASK hardcoded to 0xFF as latest bpftrace(v0.14.0-22-g4e66) was throwing macro recursion limit error. But v0.11.3 works with REQ_OP_MASK
+    $action = (((struct request *)arg1)->cmd_flags & 0xFF);
+   
+	// Track only Write and ZMS Finish/Reset/Open -ignore all other cmds 
+	if ( $action == REQ_OP_WRITE || (($action >= REQ_OP_ZONE_OPEN) && ($action <= REQ_OP_ZONE_RESET_ALL))) {
+		// Get CmdId
+		$cmdid = ((struct request *)arg1)->tag;
+		// Get QNum
+		$qnum = (uint16)(((struct request *)arg1)->mq_hctx->queue_num + 1);
+
+		if (@stop_print != 1) {
+			return;
+		}
+		if ($action == REQ_OP_WRITE) {
+			// Store the write cmd start time stamp
+			@wrt_lat_map[$qnum, $cmdid] = nsecs;
+			return;
+		}
+
+		// Print the start markers for ZMS Finish - used to identify if a Finish was
+		// ongoing when the write latency spike occured.
+
+		if ($action == REQ_OP_ZONE_FINISH) {
+			printf("F");
+		}
+
+		// Store the ZMS cmd start time stamp
+		@zms_lat_map[$qnum, $cmdid] = nsecs;
+	}
+}
+
+
+k:nvme_complete_rq
+{
+
+    // Works on latest bpftrace(v0.14.0-22-g4e66)	
+    $cmdptr = (struct nvme_command *)*(arg0+sizeof(struct request));
+
+	$op_code = $cmdptr->common.opcode;
+
+	if (($op_code != nvme_cmd_write) && ($op_code != nvme_cmd_zone_mgmt_send)) {
+        return;
+    }
+
+    $cmdid = ((struct request *)arg0)->tag;
+    $qnum = (uint16)(((struct request *)arg0)->mq_hctx->queue_num + 1);
+
+	// Convert __data_len to 512B ss to match with __sector
+	$datlen = (((struct request *)arg0)->__data_len >> 9);
+	$secnum = ((struct request *)arg0)->__sector;
+
+	// Get the zone start lba
+	// 0xffc00000 is the mask for ZN540 ZSZE 0x400000
+	$zone = ($secnum & 0xffc00000);
+
+
+	if ($op_code == nvme_cmd_write) {
+    	$start = @wrt_lat_map[$qnum, $cmdid];
+		delete(@wrt_lat_map[$qnum, $cmdid]);
+		$cmdtime = $start ? (nsecs - $start)/1000 : 0;
+
+		if ($cmdtime == 0) {
+			// If the cmd start time was not tracked, ignore this cmd
+			return;
+		}
+
+		if ($secnum == $zone) {
+			// Implicit Open case
+			@active_map[$zone] = 1;
+			@num_active_z++;
+			printf("IO %u %lx\n", @num_active_z, $zone);
+
+			// 0x1e5800 = ZSZE - ZCAP
+		} else if ( !(($secnum + $datlen + 0x1e5800) % 0x400000 ) ) {
+			// Implicit Finish case
+			if (@active_map[$zone] == 1) {
+				delete(@active_map[$zone]);
+				@num_active_z--;
+				printf("IF %u %lx\n", @num_active_z, $zone);
+			}
+		}
+		// Enable to generate write cmd latency histogram 
+    	// @usec_wrt_lat = hist($cmdtime);
+
+		// Check 192K writes (unit 512B sect) - modify as per requirement
+		if ($datlen == 376) {
+			// Flag 192K write cmds if latency > 20ms
+			if (($cmdtime > 20000)) {
+				printf("**%lx %u %s\n", $secnum, $cmdtime, strftime("%M:%S", nsecs));
+				// If latency > 100ms, start printing the latency of all pending wrie cmds
+				// Note that once @stop_print is 0, no new cmds are tracked
+				if ($cmdtime > 100000) {
+					//exit();
+					@stop_print  = 0;
+				}
+			}
+		}
+
+		//Print write cmds latency
+		if (@stop_print == 0) {
+			printf("%lx %lx %u\n", $secnum, $datlen, $cmdtime);
+		}
+
+	}
+
+	if ($op_code == nvme_cmd_zone_mgmt_send) {
+    	$start = @zms_lat_map[$qnum, $cmdid];
+		delete(@zms_lat_map[$qnum, $cmdid]);
+		$cmdtime = $start ? (nsecs - $start)/1000 : 0;
+
+		//  $cmdtime is 0 if start time was not logged for cmd. Skip the cmd.
+		if ($cmdtime == 0) {
+			return;
+		}
+
+		// Enable to generate ZMS latency histogram
+    		//@usec_zms_lat = hist($cmdtime);
+
+		// Get th ZMS sub-op type
+		$zsa = ((struct nvme_command *)$cmdptr)->zms.zsa;
+
+		// Track only Finish, Open and Reset - ignore Close as it does not change Active Zone state
+		if (($zsa >= 2) && ($zsa <= 4)) {
+
+			// Explicit Open case
+			if ($zsa == 3) {
+				@active_map[$secnum] = 1;
+				@num_active_z++;
+				printf("EO %u %lx\n", @num_active_z, $secnum);
+
+			} else {
+
+				// Account for Explicit Finish & Reset cases only if zone is already Active
+				if (@active_map[$secnum] == 1) {
+					delete(@active_map[$secnum]);
+					@num_active_z--;
+
+					if ($zsa == 2) {
+						printf("EF %u %lx %u %s\n", @num_active_z, $secnum, $cmdtime, strftime("%M:%S", nsecs));
+					} else {
+						printf("RE %u %lx\n", @num_active_z, $secnum);
+					}
+
+				}
+			} 
+			//printf(":%u %u %lx %s\n", $zsa, $cmdtime, $secnum, strftime("%M:%S", nsecs));
+		}
+	}
+}
+
+

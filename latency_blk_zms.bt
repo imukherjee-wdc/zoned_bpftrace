@@ -1,0 +1,77 @@
+/*
+ * latency_blk_zms.bt - Bpftrace script for ZMS cmds latency (open/close/finish/reset/resetall).
+ *                  Shows following info for each ZMS op:
+ *                  - Per ZMS cmd latency
+ *                  - Max and Avg. latency for each ZMS Op type
+ *                  - Latency histogram for each ZMS Op type
+ *
+ *                  All units are in usec.
+ *
+ *                  Works at mq blk layer level and tested for Zoned SSDs.
+ *                  Untested but should work for Zoned HDDs also.
+ */                  
+
+#include <linux/nvme.h>
+#include <linux/blkdev.h>
+#include <linux/blk-mq.h>
+
+
+BEGIN {
+
+    @zms_str[REQ_OP_ZONE_CLOSE] = "C";
+    @zms_str[REQ_OP_ZONE_FINISH] = "F";
+    @zms_str[REQ_OP_ZONE_OPEN] = "O";
+    @zms_str[REQ_OP_ZONE_RESET] = "R";
+    @zms_str[REQ_OP_ZONE_RESET_ALL] = "RA";
+
+	printf("\nLAT\n");
+}
+
+kfunc:__blk_account_io_start
+// Enable for linux-5.15 or lesser
+//kfunc:blk_account_io_start
+{
+    
+    // REQ_OP_MASK hardcoded to 0xFF as latest bpftrace(v0.14.0-22-g4e66) was
+    // throwing macro recursion limit error. But v0.11.3 works with REQ_OP_MASK
+    $reqop = (args->rq->cmd_flags & 0xFF);
+    $secnum = args->rq->__sector;
+
+    if ( (($reqop >= REQ_OP_ZONE_OPEN) && ($reqop <= REQ_OP_ZONE_RESET_ALL)) ) {
+
+		@zms_lat_map[$secnum] = nsecs;
+        //printf("%-2s %6u %s\n", @zms_str[$reqop], $secnum >> 22, comm);
+    }
+}
+
+kfunc:__blk_account_io_done
+// Enable for linux-5.15 or lesser
+//kfunc:blk_account_io_done
+/@zms_lat_map[args->req->__sector] !=0/
+{
+    $secnum = args->req->__sector;
+
+    // REQ_OP_MASK hardcoded to 0xFF as latest bpftrace(v0.14.0-22-g4e66) was
+    // throwing macro recursion limit error. But v0.11.3 works with REQ_OP_MASK
+    $reqop = (args->req->cmd_flags & 0xFF);
+
+    if ( (($reqop >= REQ_OP_ZONE_OPEN) && ($reqop <= REQ_OP_ZONE_RESET_ALL)) ) {
+
+        $start = @zms_lat_map[$secnum];
+        delete(@zms_lat_map[$secnum]);
+
+        $cmdtime = $start ? (nsecs - $start)/1000 : 0;
+
+        //printf("%-4s %12u %6u\n", @zms_str[$reqop], $cmdtime, $secnum >> 22)
+		// Show the ZMS Op type and latency for the completed cmd
+		printf("%-4s %12u\n", @zms_str[$reqop], $cmdtime); 
+
+        @usec_zms_lat[@zms_str[$reqop]] = hist($cmdtime);
+        @latmax[@zms_str[$reqop]] = max($cmdtime);
+        @latavg[@zms_str[$reqop]] = avg($cmdtime);
+    }
+}
+
+END {
+    clear(@zms_str);
+}

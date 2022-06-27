@@ -1,0 +1,47 @@
+/*
+ * count_blk_zms.bt - Bpftrace script for counting Explicit ZMS cmds (explicit open/close/finish/reset/resetall).
+ *                    Shows following info for each ZMS op:
+ *                  - Total op count for the duration of script execution
+ * Notes:
+ *                  - Count is irrespective of success/failure at device level.
+ *                  - Works at mq blk layer level and tested for Zoned SSDs.
+ *                  - Untested but should work for Zoned HDDs also.
+ */                  
+
+#include <linux/nvme.h>
+#include <linux/blkdev.h>
+#include <linux/blk-mq.h>
+
+
+
+BEGIN {
+
+    @zms_str[REQ_OP_ZONE_CLOSE] = "C";
+    @zms_str[REQ_OP_ZONE_FINISH] = "F";
+    @zms_str[REQ_OP_ZONE_OPEN] = "O";
+    @zms_str[REQ_OP_ZONE_RESET] = "R";
+    @zms_str[REQ_OP_ZONE_RESET_ALL] = "RA";
+
+	printf("\nLAT\n");
+}
+
+kfunc:__blk_account_io_start
+// Enable for linux-5.15 or lesser
+//kfunc:blk_account_io_start
+{
+    
+    // REQ_OP_MASK hardcoded to 0xFF as latest bpftrace(v0.14.0-22-g4e66) was
+    // throwing macro recursion limit error. But v0.11.3 works with REQ_OP_MASK
+    $reqop = (args->rq->cmd_flags & 0xFF);
+    $secnum = args->rq->__sector;
+
+    if ( (($reqop >= REQ_OP_ZONE_OPEN) && ($reqop <= REQ_OP_ZONE_RESET_ALL)) ) {
+
+	@count_zms[@zms_str[$reqop]] = count();
+        //printf("%-2s %6u %s\n", @zms_str[$reqop], $secnum >> 22, comm);
+    }
+}
+
+END {
+    clear(@zms_str);
+}

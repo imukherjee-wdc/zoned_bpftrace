@@ -1,0 +1,25 @@
+This directory contains bpftrace scripts for Zoned Devices.
+
+bpftrace project: https://github.com/iovisor/bpftrace
+
+Documentation: https://github.com/iovisor/bpftrace/blob/master/docs/reference_guide.md
+
+Build Instructions: https://github.com/iovisor/bpftrace/blob/master/README.md
+
+It's preferable to get the latest from github and build instead of installing the versions
+packages by distributions which are generally older. bpftrace is a fast moving project and
+older versions are likely to have bugs or missing features.
+
+Scripts summary:
+- count_blk_zms.bt - Count the total for all ZMS(Zone Mgmt. Send) cmds issued.
+- latency_blk_zms.bt - Track the latency of ZMS (Zone Mgmt. Send) cmds at block layer level.
+- active_zone_tracker.bt - Track the active zones during host workloads. Helps check whether all
+   active zones are being utilised.
+- wrt_zms_lat_and_actv_zone_tracker.bt - Tracks write & ZMS cmds latency, highlights latency
+   spikes(threshold should be set by user) and tracks active zone utilisation.
+
+Scripts have detailed explanation and usage notes within.
+
+Contact Indraneel.Mukherjee@wdc.com for any queries.
+
+
