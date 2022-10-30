@@ -1,20 +1,20 @@
 /*
- * cmd_lat_actv_zone_tracker.bt - does the following:
- * 1. Track latency for all Write cmds
- * 2. Track latency for all ZMS cmds (Finish, Reset & Open only)
- * 3. Track Active Zones. Lists every action that results in change to
- *    no. of Active Zones (IO, EO, IF, EF, RE)
- * 4. If latency for particular write cmd exceeds set threshold, flags it, stops
- *    tracking further cmds and prints latency of all outstanding cmds
- * 5. Identify ongoing Resets and Finish when write latency spike occurs
- * 6. On ending the program(^C), the list of Active Zones is printed.
+ * cmd_lat_actv_zone_tracker.bt
+ * 1. Script works at nvme driver level.
+ * 2. Tracks latency for all Write cmds.
+ * 3. Tracks latency for all ZMS cmds (Finish, Open & Reset(on active zone) only).
+ * 4. Tracks Active Zones. Lists every action that results in change to
+ *    no. of Active Zones (IO, EO, IF, EF, RE).
+ * 5. If latency for particular write cmd exceeds set threshold, flags it, stops
+ *    tracking further cmds and prints latency of all outstanding cmds.
+ * 6. Identifies ongoing Reset and Finish cmds when write latency spike occurs.
+ * 7. On ending the program(^C), the list of Active Zones is printed.
  *
- * Notes:
- * 1: At nvme driver level, __sector in 512 byte based and __data_len is byte based
- * 2: Has some hard codes that are applicable for ZN540. Review and change for other SSDs.
- * 3. Latency threshold hard-coded to prevent slowdown - change values directly in code below
- * 4. Flags 192K writes that take more than 20msec as an example. User can tune as per needs.
- *
+ * Usage Notes:
+ * 1: REVIEW and CHANGE below macros for your SSD. Currently defined for ZN540.
+ * 2. Latency threshold macros - REVIEW and CHANGE values as per usecase.
+ * 3. Default latenct tracker set to report 192K writes if completion time >20msec.
+ *    Also, script is halted if completion time > 100msec. User can tune these values as needed.
  */
 
 
@@ -22,10 +22,31 @@
 #include <linux/blkdev.h>
 #include <linux/blk-mq.h>
 
+/*******!!!!! REVIEW AND MODIFY BEFORE RUNNING THE SCRIPT !!!!!*******/
+
+/* Current definitions are for ZN540 (defined in 512b sector size unit) */
+#define SSD_ZONE_SIZE		0x400000
+#define SSD_ZONE_CAPACITY	0x21A800
+/* Current value for 196K write */
+#define FLAG_WRITE_DATALEN			376
+/* Flag writes above this time - unit is usec - 20000 is 20ms */
+#define FLAG_WRITE_CMD_TIME			20000
+/* Halt script if write completion take more than this time - unit is usec - 100000 is 100ms */
+#define FLAG_WRITE_CMD_TIME_HALT	100000
+
+
+/* No need to modify these */
+#define SSD_ZONE_SIZE_MASK ((0xFFFFFFFF - SSD_ZONE_SIZE)+1)
+#define SSD_ZONE_SZ_CAP_DIFF (uint64)(SSD_ZONE_SIZE - SSD_ZONE_CAPACITY)
+
+#define SSD_512B_SHIFT 9
+
 
 BEGIN {
 
-	// Switch to toggle cmd info printing - default init to 1 to stop prints
+	/* Switch to toggle printing pending cmd info - default init to 1 to stop prints
+	 * If the script halt timeout is hit, stop_print is toggled to print the pending cmds
+	 */
 	@stop_print = 1;
 
 	// Counter for Active Zones
@@ -86,12 +107,12 @@ k:nvme_complete_rq
     $qnum = (uint16)(((struct request *)arg0)->mq_hctx->queue_num + 1);
 
 	// Convert __data_len to 512B ss to match with __sector
-	$datlen = (((struct request *)arg0)->__data_len >> 9);
+	// At nvme driver level, __sector is 512 byte based and __data_len is byte based.
+	$datlen = (((struct request *)arg0)->__data_len >> SSD_512B_SHIFT);
 	$secnum = ((struct request *)arg0)->__sector;
 
 	// Get the zone start lba
-	// 0xffc00000 is the mask for ZN540 ZSZE 0x400000
-	$zone = ($secnum & 0xffc00000);
+	$zone = ($secnum & SSD_ZONE_SIZE_MASK);
 
 
 	if ($op_code == nvme_cmd_write) {
@@ -111,7 +132,7 @@ k:nvme_complete_rq
 			printf("IO %u %lx\n", @num_active_z, $zone);
 
 			// 0x1e5800 = ZSZE - ZCAP
-		} else if ( !(($secnum + $datlen + 0x1e5800) % 0x400000 ) ) {
+		} else if ( !(($secnum + $datlen + SSD_ZONE_SZ_CAP_DIFF) % SSD_ZONE_SIZE ) ) {
 			// Implicit Finish case
 			if (@active_map[$zone] == 1) {
 				delete(@active_map[$zone]);
@@ -123,24 +144,26 @@ k:nvme_complete_rq
     	// @usec_wrt_lat = hist($cmdtime);
 
 		// Check 192K writes (unit 512B sect) - modify as per requirement
-		if ($datlen == 376) {
-			// Flag 192K write cmds if latency > 20ms
-			if (($cmdtime > 20000)) {
+		if ($datlen == FLAG_WRITE_DATALEN) {
+			// Flag write cmds if latency > FLAG_WRITE_CMD_TIME
+			if (($cmdtime > FLAG_WRITE_CMD_TIME)) {
 				printf("**%lx %u %s\n", $secnum, $cmdtime, strftime("%M:%S", nsecs));
-				// If latency > 100ms, start printing the latency of all pending wrie cmds
+				// If latency > FLAG_WRITE_CMD_TIME_HALT, start printing the latency of all pending wrie cmds
 				// Note that once @stop_print is 0, no new cmds are tracked
-				if ($cmdtime > 100000) {
+				if ($cmdtime > FLAG_WRITE_CMD_TIME_HALT) {
 					//exit();
+					printf("HALTED\n");
 					@stop_print  = 0;
 				}
 			}
 		}
 
-		//Print write cmds latency
+		/* If $cmdtime > FLAG_WRITE_CMD_TIME_HALT condition is hit, print write cmds latency for pending cmds.
+		 * This is just additional debug info.
+		 */
 		if (@stop_print == 0) {
 			printf("%lx %lx %u\n", $secnum, $datlen, $cmdtime);
 		}
-
 	}
 
 	if ($op_code == nvme_cmd_zone_mgmt_send) {
@@ -153,17 +176,17 @@ k:nvme_complete_rq
 			return;
 		}
 
-		// Enable to generate ZMS latency histogram
-    		//@usec_zms_lat = hist($cmdtime);
+		// Uncomment to generate ZMS latency histogram
+		//@usec_zms_lat = hist($cmdtime);
 
-		// Get th ZMS sub-op type
+		// Get the ZMS sub-op type
 		$zsa = ((struct nvme_command *)$cmdptr)->zms.zsa;
 
 		// Track only Finish, Open and Reset - ignore Close as it does not change Active Zone state
-		if (($zsa >= 2) && ($zsa <= 4)) {
+		if (($zsa >= NVME_ZONE_FINISH) && ($zsa <= NVME_ZONE_RESET)) {
 
 			// Explicit Open case
-			if ($zsa == 3) {
+			if ($zsa == NVME_ZONE_OPEN) {
 				@active_map[$secnum] = 1;
 				@num_active_z++;
 				printf("EO %u %lx\n", @num_active_z, $secnum);
@@ -175,12 +198,11 @@ k:nvme_complete_rq
 					delete(@active_map[$secnum]);
 					@num_active_z--;
 
-					if ($zsa == 2) {
+					if ($zsa == NVME_ZONE_FINISH) {
 						printf("EF %u %lx %u %s\n", @num_active_z, $secnum, $cmdtime, strftime("%M:%S", nsecs));
 					} else {
 						printf("RE %u %lx\n", @num_active_z, $secnum);
 					}
-
 				}
 			} 
 			//printf(":%u %u %lx %s\n", $zsa, $cmdtime, $secnum, strftime("%M:%S", nsecs));
@@ -188,4 +210,7 @@ k:nvme_complete_rq
 	}
 }
 
+END {
+    clear(@stop_print);
+}
 

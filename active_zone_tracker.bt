@@ -2,8 +2,9 @@
  * active_zone_tracker.bt - Script to track Active Zones at nvme driver level.
  * Lists every action that results in change to no. of Active Zones (IO, EO, IF, EF, RE)
  *
- * 1: At nvme driver level, __sector in 512 byte based and __data_len is byte based
- * 2: Has some hard codes that are applicable for ZN540. Review and change for other SSDs.
+ * Usage Notes:
+ * 1: Review and change below macros for your SSD. Currently defined for ZN540.
+ * 2: At nvme driver level, __sector in 512 byte based and __data_len is byte based.
  *
  */
 
@@ -11,11 +12,23 @@
 #include <linux/blkdev.h>
 #include <linux/blk-mq.h>
 
+/*******!!!!! MODIFY BEFORE RUNNING THE SCRIPT !!!!!*******/
+/* Define in terms of 512b ss units */
+/* Current definitions are for ZN540 (512b sector size unit) */
+#define SSD_ZONE_SIZE		0x400000
+#define SSD_ZONE_CAPACITY	0x21A800
+
+
+/* No need to modify these */
+#define SSD_ZONE_SIZE_MASK ((0xFFFFFFFF - SSD_ZONE_SIZE)+1)
+#define SSD_ZONE_SZ_CAP_DIFF (uint64)(SSD_ZONE_SIZE - SSD_ZONE_CAPACITY)
+
+#define SSD_512B_SHIFT 9
+
 
 BEGIN {
 
 	@num_active_z = 0;
-
 }
 
 /* Trace every nvme cmd at nvme_complete_rq() level */
@@ -37,11 +50,10 @@ k:nvme_complete_rq
 	$secnum = ((struct request *)arg0)->__sector;
 
 	// Convert datalen to 512b ss, similar to $secnum
-	$datlen = (((struct request *)arg0)->__data_len >> 9);
+	$datlen = (((struct request *)arg0)->__data_len >> SSD_512B_SHIFT);
 
 	// Get the zone start lba using the Zone Size mask
-	// ZSZE for ZN540 is 0x400000(512b ss)
-	$zone = ($secnum & 0xffc00000);
+	$zone = ($secnum & SSD_ZONE_SIZE_MASK);
 
 
 	if ($op_code == nvme_cmd_write) {
@@ -50,15 +62,14 @@ k:nvme_complete_rq
 			// Implicit Open case
 			@active_map[$zone] = 1;
 			@num_active_z++;
-			printf("IO %u %lx\n", @num_active_z, $zone);
+			printf("%u IO %lx\n", @num_active_z, $zone);
 
-			//0x1e5800 is diff b/w ZSZE and ZCAP in 512b ss on BBZ
-		} else if ( !(($secnum + $datlen + 0x1e5800) % 0x400000 ) ) {
+		} else if ( !(($secnum + $datlen + SSD_ZONE_SZ_CAP_DIFF) % SSD_ZONE_SIZE ) ) {
 			// Implicit Finish case
 			if (@active_map[$zone] == 1) {
 				delete(@active_map[$zone]);
 				@num_active_z--;
-				printf("IF %u %lx\n", @num_active_z, $zone);
+				printf("%u IF %lx\n", @num_active_z, $zone);
 			}
 		}
 	}
@@ -68,20 +79,20 @@ k:nvme_complete_rq
 		$zsa = ((struct nvme_command *)$cmdptr)->zms.zsa;
 
 		//For Active Zone tracking, ignore ZMS Close, focus only on Finish, Reset & Open
-		if (($zsa >= 2) && ($zsa <= 4)) {
-			if ($zsa == 3) {
+		if (($zsa >= NVME_ZONE_FINISH) && ($zsa <= NVME_ZONE_RESET)) {
+			if ($zsa == NVME_ZONE_OPEN) {
 				@active_map[$secnum] = 1;
 				@num_active_z++;
-				printf("EO %u %lx\n", @num_active_z, $secnum);
+				printf("%u EO %lx\n", @num_active_z, $secnum);
 			} else {
 				if (@active_map[$secnum] == 1) {
 					delete(@active_map[$secnum]);
 					@num_active_z--;
 
-					if ($zsa == 2) {
-						printf("EF %u %lx\n", @num_active_z, $secnum);
+					if ($zsa == NVME_ZONE_FINISH) {
+						printf("%u EF %lx\n", @num_active_z, $secnum);
 					} else {
-						printf("RE %u %lx\n", @num_active_z, $secnum);
+						printf("%u RE %lx\n", @num_active_z, $secnum);
 					}
 				}
 			} 

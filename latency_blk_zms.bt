@@ -1,14 +1,13 @@
 /*
  * latency_blk_zms.bt - Bpftrace script for ZMS cmds latency (open/close/finish/reset/resetall).
- *                  Shows following info for each ZMS op:
- *                  - Per ZMS cmd latency
- *                  - Max and Avg. latency for each ZMS Op type
- *                  - Latency histogram for each ZMS Op type
- *
- *                  All units are in usec.
- *
- *                  Works at mq blk layer level and tested for Zoned SSDs.
- *                  Untested but should work for Zoned HDDs also.
+ *                      Shows following info for each ZMS op:
+ *                      - Per ZMS cmd latency
+ *                      - Max and Avg. latency for each ZMS Op type
+ *                      - Latency histogram for each ZMS Op type
+ * Usage Notes:
+ * - All units are in usec.
+ * - Works at mq blk layer level.
+ * - Tested for Zoned SSD and emulated ZBC disk.
  */                  
 
 #include <linux/nvme.h>
@@ -28,7 +27,7 @@ BEGIN {
 }
 
 kfunc:__blk_account_io_start
-// Enable for linux-5.15 or lesser
+// Uncomment for linux-5.15 or lesser
 //kfunc:blk_account_io_start
 {
     
@@ -40,7 +39,7 @@ kfunc:__blk_account_io_start
     if ( (($reqop >= REQ_OP_ZONE_OPEN) && ($reqop <= REQ_OP_ZONE_RESET_ALL)) ) {
 
 		@zms_lat_map[$secnum] = nsecs;
-        //printf("%-2s %6u %s\n", @zms_str[$reqop], $secnum >> 22, comm);
+        //printf("%-2s %8lu %s\n", @zms_str[$reqop], $secnum, comm);
     }
 }
 
@@ -62,9 +61,9 @@ kfunc:__blk_account_io_done
 
         $cmdtime = $start ? (nsecs - $start)/1000 : 0;
 
-        //printf("%-4s %12u %6u\n", @zms_str[$reqop], $cmdtime, $secnum >> 22)
-		// Show the ZMS Op type and latency for the completed cmd
-		printf("%-4s %12u\n", @zms_str[$reqop], $cmdtime); 
+		// Print the ZMS Op type and latency for the completed cmd
+		//printf("%-4s %8lu %8lu\n", @zms_str[$reqop], $cmdtime, $secnum)
+		printf("%-4s %8lu\n", @zms_str[$reqop], $cmdtime);
 
         @usec_zms_lat[@zms_str[$reqop]] = hist($cmdtime);
         @latmax[@zms_str[$reqop]] = max($cmdtime);
